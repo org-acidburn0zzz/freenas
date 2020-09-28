@@ -84,11 +84,25 @@ class NFSService(SystemServiceService):
         else:
             found = True
 
+        try:
+            bindip_was_set_up = await self.middleware.call('cache.get', 'nfs.bindip.set_up')
+        except KeyError:
+            bindip_was_set_up = None
+
         if found:
+            await self.middleware.call('cache.put', 'nfs.bindip.set_up', True)
+            if not bindip_was_set_up:
+                await self.middleware.call('cache.put', 'nfs.pending_restart', True)
+
             await self.middleware.call('alert.oneshot_delete', 'NFSBindAddress', None)
+
             return bindip
         else:
-            await self.middleware.call('alert.oneshot_create', 'NFSBindAddress', None)
+            await self.middleware.call('cache.put', 'nfs.bindip.set_up', False)
+
+            if await self.middleware.call('interface.are_set_up'):
+                await self.middleware.call('alert.oneshot_create', 'NFSBindAddress', None)
+
             return []
 
     @accepts(Dict(
@@ -535,6 +549,20 @@ class SharingNFSService(SharingService):
         return data
 
 
+async def interface_post_sync(middleware):
+    if osc.IS_FREEBSD:
+        await middleware.call('etc.generate', 'rc')
+
+        try:
+            pending_restart = await middleware.call('cache.get', 'nfs.pending_restart')
+            await middleware.call('cache.pop', 'nfs.pending_restart')
+        except KeyError:
+            pending_restart = False
+
+        if pending_restart:
+            await middleware.call('service.restart', 'nfs')
+
+
 async def pool_post_import(middleware, pool):
     """
     Makes sure to reload NFS if a pool is imported and there are shares configured for it.
@@ -568,4 +596,6 @@ class NFSFSAttachmentDelegate(LockableFSAttachmentDelegate):
 
 async def setup(middleware):
     await middleware.call('pool.dataset.register_attachment_delegate', NFSFSAttachmentDelegate(middleware))
+
+    middleware.register_hook('interface.post_sync', interface_post_sync)
     middleware.register_hook('pool.post_import', pool_post_import, sync=True)

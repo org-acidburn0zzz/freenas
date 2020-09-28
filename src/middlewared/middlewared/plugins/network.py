@@ -388,6 +388,7 @@ class InterfaceService(CRUDService):
         super().__init__(*args, **kwargs)
         self._original_datastores = {}
         self._rollback_timer = None
+        self._are_set_up = False
 
     @filterable
     def query(self, filters, options):
@@ -1726,6 +1727,10 @@ class InterfaceService(CRUDService):
         return data
 
     @private
+    async def are_set_up(self):
+        return self._are_set_up
+
+    @private
     async def sync(self, wait_dhcp=False):
         """
         Sync interfaces configured in database to the OS.
@@ -1842,6 +1847,8 @@ class InterfaceService(CRUDService):
             await self.middleware.call('route.sync')
         except Exception:
             self.logger.info('Failed to sync routes', exc_info=True)
+
+        self._are_set_up = True
 
         await self.middleware.call_hook('interface.post_sync')
 
