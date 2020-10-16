@@ -30,7 +30,6 @@ import copy
 import getpass
 import os
 import platform
-import re
 import signal
 import sys
 import subprocess
@@ -53,13 +52,13 @@ if os.geteuid() != 0:
 FREENAS_DATA_PATH = "/data"
 FREENAS_DB = os.path.join(FREENAS_DATA_PATH, "freenas-v1.db")
 IS_LINUX = platform.system().lower() == 'linux'
-LAGGType = (
-    ('failover', 'Failover'),
-    ('lacp', 'LACP'),
-    ('loadbalance', 'Load Balance'),
-    ('roundrobin', 'Round Robin'),
-    ('none', 'None'),
-)
+LAGGTypes = {
+    '1': ("FAILOVER", "Failover"),
+    '2': ("LACP", "LACP"),
+    '3': ("LOADBALANCE", "Load Balance"),
+    '4': ("ROUNDROBIN", "Round Robin"),
+    '5': ("not_used", 'None'),
+}
 
 
 def _(s):
@@ -76,7 +75,7 @@ def get_nic_choices():
     choices = []
     try:
         with Client() as c:
-            choices = sorted([i['id'] for i in c.call('interface.query')])
+            choices = c.call('interface.query')
     except Exception as e:
         print('Failed to obtain list of interfaces with error: \n%s', e)
 
@@ -321,29 +320,9 @@ def produce_django_model(ds):
     return Model
 
 
-LAGGInterfaceMembers = produce_django_model("network.lagginterfacemembers")
 GlobalConfiguration = produce_django_model("network.globalconfiguration")
 StaticRoute = produce_django_model("network.staticroute")
 Support = produce_django_model("system.support")
-
-
-class Interfaces(DjangoModel):
-    datastore = "network.interfaces"
-
-    def __str__(self):
-        if not self.int_name:
-            return self.int_interface
-        return str(self.int_name)
-
-
-class LAGGInterface(DjangoModel):
-    datastore = "network.lagginterface"
-
-    def __init__(self, **kwargs):
-        if 'lagg_interface' in kwargs and isinstance(kwargs['lagg_interface'], dict):
-            kwargs['lagg_interface'] = Interfaces(**kwargs['lagg_interface'])
-
-        super().__init__(**kwargs)
 
 
 class FailoverIsEnabledException(Exception):
@@ -382,74 +361,6 @@ def prompt(prompt_str, default_value=None):
     return (prompt_str + default_str + ':')
 
 
-def get_nic(choices=None):
-    nic = False
-
-    if choices is None:
-        choices = NICChoices()
-
-    while True:
-        nics = []
-        for i, c in enumerate(choices):
-            nics.append(c[0])
-            print("%d) %s" % (i + 1, nics[i]))
-
-        _input = input(_("Select an interface (q to quit): "))
-        if _input.isdigit() and int(_input) in range(1, len(nics) + 1):
-            nic = nics[int(_input) - 1]
-            break
-        elif _input.lower().startswith("q"):
-            return False
-
-    return nic
-
-
-def get_lagg_proto():
-    proto = False
-
-    with Client() as c:
-        is_enterprise = c.call('system.is_enterprise')
-        failover_licensed = False
-        if is_enterprise:
-            failover_licensed = c.call('failover.licensed')
-
-    while True:
-        protos = {}
-        types = LAGGType
-        if is_enterprise and failover_licensed:
-            types = list(filter(lambda x: x[0] != 'failover', types))
-        for i, t in enumerate(types):
-            protos[i] = t[0]
-            print("%d) %s" % (i + 1, protos[i]))
-
-        _input = input(_("Select a lagg protocol (q to quit): "))
-        if _input.isdigit() and int(_input) in range(1, len(protos) + 1):
-            proto = protos[int(_input) - 1]
-            break
-        elif _input.lower().startswith("q"):
-            return False
-
-    return proto
-
-
-def get_lagg_nics():
-    nics = list(NICChoices(nolagg=True))
-    if not nics:
-        print("All interfaces are already allocated to LAGG or VLAN, cannot proceed.")
-        return []
-
-    group = []
-    while nics:
-        nic = get_nic(nics)
-        if not nic:
-            break
-        group.append(nic)
-
-        nics = [n for n in nics if n[0] != nic]
-
-    return group
-
-
 def configure_interface_stub(*args):
 
     retval = configure_interface()
@@ -466,7 +377,17 @@ def configure_interface_stub(*args):
 def configure_interface():
 
     # get list of nics
-    choices = get_nic_choices()
+    nics = get_nic_choices()
+
+    # build exclusion list
+    exclude = []
+    for i in nics:
+        if i['type'] == 'LINK_AGGREGATION':
+            for j in i['lag_ports']:
+                exclude.append(j)
+
+    # sort the nics
+    choices = sorted([i['id'] for i in nics if i['id'] not in exclude])
 
     # this shouldn't happen but check anyway
     if not choices:
@@ -501,7 +422,7 @@ def configure_interface():
     except Exception:
         pass
 
-    # we need to delete the interface from db before we proceed
+    # we need to delete the interface config from db before we proceed
     if iface_configured and not nic.startswith(('vlan', 'lagg')):
         while True:
             print("Interface has been previously configured, the current configuration must be deleted before proceeding.")
@@ -970,156 +891,189 @@ def reset_factory_defaults(*args):
 
 def configure_lagg_interface(*args):
 
-    menu = [
-        [_("Create Link Aggregation"), create_lagg_interface],
-        [_("Delete Link Aggregation"), delete_lagg_interface],
-    ]
-    menu_map = {}
-    menu_max = 0
-    for item in menu:
-        menu_max = menu_max + 1
-        menu_map[menu_max] = item
+    lagg_menu = {
+        '1': "Create Link Aggregation",
+        '2': "Delete Link Aggregation",
+        '3': "Quit",
+    }
+    for k, v in lagg_menu.items():
+        print(f'{k}) {v}')
 
+    create_lagg = delete_lagg = False
     while True:
-        print()
-
-        for index in menu_map:
-            print("%d) %s" % (index, menu_map[index][0]))
-
-        _input = input(_("Enter an option from 1-%d (enter q to quit): ") % (menu_max))
-        if _input.isdigit() and int(_input) in range(1, menu_max + 1):
-            ch = int(_input)
-            if ch in menu_map:
-                menu_map[ch][1]()
+        _input = input(f"\nEnter an option from 1-{len(lagg_menu)} (q to quit): ")
+        if _input in lagg_menu.keys():
+            if _input == '3':
+                return False
+            elif _input == '1':
+                create_lagg = True
                 break
-        elif _input.lower().startswith("q"):
+            elif _input == '2':
+                delete_lagg = True
+                break
+        else:
+            print("Invalid option")
+            continue
+
+    # get our list of nics
+    nics = get_nic_choices()
+
+    # fbsd uses a different name than linux for "laggs"
+    os_lagg_name = 'lagg' if not IS_LINUX else 'bond'
+
+    # prep list of nics if creating lagg
+    if create_lagg:
+        exclude = []
+        for i in nics:
+            if i['type'] == 'LINK_AGGREGATION':
+                exclude.append(i['id'])
+                for j in i['lag_ports']:
+                    exclude.append(j)
+            elif i['type'] == 'VLAN':
+                exclude.append(i['id'])
+
+        # sort the nics
+        choices = sorted([i['id'] for i in nics if i['id'] not in exclude])
+
+        # something happend or all phys ints are being used by laggs
+        if not choices:
+            print("No interfaces available")
             return False
-        continue
 
+        # can't create a lagg with only 1 member interface
+        if len(choices) == 1:
+            print("lagg interfaces require at least 2 member interfaces")
+            return False
 
-def create_lagg_interface():
-    lagg_index = 0
-    lagg_interfaces = LAGGInterface.objects.all()
-    for li in lagg_interfaces:
-        lagg_index = int(re.split('([0-9]+)$', str(li.lagg_interface))[1]) + 1
+        # prompt for member interfaces
+        members = []
+        while choices:
+            for idx, nic in enumerate(choices, start=1):
+                print(f"{idx}) {nic}")
 
-    lagg_proto = get_lagg_proto()
-    if not lagg_proto:
-        return True
+            _parent_input = input("Select a member interface (q to quit): ")
+            if _parent_input.lower().startswith("q") and not members:
+                # means they quit before choosing any member interfaces
+                return False
+            elif _parent_input.lower().startswith("q") and len(members) >= 2:
+                # assume they've chosen all the member interfaces they want
+                break
+            elif _parent_input.isdigit():
+                _parent_input = int(_parent_input)
+            else:
+                print("Invalid option")
+                continue
 
-    lagg_nics = get_lagg_nics()
-    if not lagg_nics:
-        return True
+            if _parent_input in range(1, len(choices) + 1):
+                members.append(choices[_parent_input - 1])
+                choices.remove(choices[_parent_input - 1])
+            else:
+                print("Invalid option")
+                continue
 
-    lagg_name = 'lagg%d' % lagg_index
-    iface = Interfaces(
-        int_interface=lagg_name,
-        int_name=lagg_name,
-        int_dhcp=False,
-        int_ipv6auto=False,
-    )
+        # get lagg interface name
+        while True:
+            _lagg_name = input(f"Enter a {os_lagg_name} name {os_lagg_name}X where 'X' is a number (q to quit): ")
+            if _lagg_name.lower().startswith('q'):
+                return False
+            elif not _lagg_name.lower().startswith(os_lagg_name):
+                continue
+            else:
+                try:
+                    int(_lagg_name.lower().split(os_lagg_name)[1])
+                    break
+                except Exception:
+                    continue
 
-    print(_("Saving interface configuration:"), end=' ')
-    try:
-        iface.save()
-    except Exception:
-        print(_("Failed"))
-        return False
-    print(_("Ok"))
+        # get lagg protocol
+        lagg_proto = None
+        while True:
+            for k, v in LAGGTypes.items():
+                print(f'{k}) {v[1]}')
 
-    lagg_iface = LAGGInterface(
-        lagg_interface=iface,
-        lagg_protocol=lagg_proto,
-    )
+            _lagg_proto = input(f"Choose a {os_lagg_name} protocol (q to quit): ")
+            if _lagg_proto.lower().startswith('q'):
+                return False
+            elif _lagg_proto.isdigit():
+                if _lagg_proto == '1':
+                    lagg_proto = LAGGTypes['1'][0]
+                    break
+                elif _lagg_proto == '2':
+                    lagg_proto = LAGGTypes['2'][0]
+                    break
+                elif _lagg_proto == '3':
+                    lagg_proto = LAGGTypes['3'][0]
+                    break
+                elif _lagg_proto == '4':
+                    lagg_proto = LAGGTypes['4'][0]
+                    break
+                else:
+                    print("Invalid option")
+                    continue
+            else:
+                print("Invalid option")
+                continue
 
-    print(_("Saving Link Aggregation configuration:"), end=' ')
-    try:
-        lagg_iface.save()
-    except Exception:
-        print(_("Failed"))
-        return False
-    print(_("Ok"))
+        # get vlan description
+        _lagg_desc = input(f"{os_lagg_name} description (enter for none): ")
 
-    order = 0
-    for nic in lagg_nics:
-        lagg_iface_member = LAGGInterfaceMembers(
-            lagg_interfacegroup=lagg_iface, lagg_ordernum=order, lagg_physnic=nic,
-        )
-        interface = Interfaces.objects.filter(int_interface=nic)
-        if not interface.exists():
-            Interfaces.objects.create(int_interface=nic, int_name=f'member of {lagg_name}')
-
-        print(_("Saving Link Aggregation member configuration:"), end=' ')
+        # send it off to the API
+        print(f"Saving {os_lagg_name} interface")
+        options = {
+            'name': _lagg_name,
+            'description': _lagg_desc,
+            'type': 'LINK_AGGREGATION',
+            'lag_protocol': lagg_proto,
+            'lag_ports': members,
+        }
         try:
-            lagg_iface_member.save()
-        except Exception:
-            print(_("Failed"))
+            with Client() as c:
+                c.call('interface.create', options)
+                c.call('service.start', 'network')
+                print(f"Successfully created {os_lagg_name}")
+                return True
+        except Exception as e:
+            print(f"Failed creating {os_lagg_name} interface with error: \n%s", e)
             return False
-        print(_("Ok"))
 
-        order += 1
+    # prep list of nics if deleting lagg
+    if delete_lagg:
+        choices = [i['id'] for i in nics if i['id'].startswith(os_lagg_name)]
+        # means no vlans are created so nothing to do
+        if not choices:
+            print(f"No {os_lagg_name} interfaces to delete")
+            input("Press enter to return to main screen\n")
+            return False
 
-    print(_("Restarting network:"), end=' ')
-    try:
-        with Client() as c:
-            c.call('service.start', 'network')
-    except Exception:
-        print(_("Failed"))
-        return False
-    print(_("ok"))
-    return True
-
-
-def delete_lagg_interface():
-    lagg_interfaces = LAGGInterface.objects.all()
-
-    if not lagg_interfaces.exists():
-        print()
-        print("No lagg interfaces configured")
-        print()
-        print("Press enter to continue")
-        input()
-        return False
-
-    lagg_map = {}
     while True:
-        print()
-        print("Select which lagg interface you would like to delete:")
-        print()
+        for idx, nic in enumerate(choices, start=1):
+            print(f"{idx}) {nic}")
 
-        for idx, li in enumerate(lagg_interfaces):
-            lagg_map[idx + 1] = li
-            print("%d) lagg%s" % (idx + 1, re.split('([0-9]+)$', str(li.lagg_interface))[1]))
-
-        print()
-
-        _input = input(_("Select an interface (q to quit): "))
-        if _input.isdigit() and int(_input) in range(1, idx + 2):
-            ch = int(_input)
-            if ch in lagg_map:
-                lagg = lagg_map[ch]
-                break
-        elif _input.lower().startswith("q"):
+        _lagg_to_delete = input(f"Select a {os_lagg_name} to delete (q to quit): ")
+        if _lagg_to_delete.lower().startswith("q"):
             return False
-        continue
+        elif _lagg_to_delete.isdigit():
+            _lagg_to_delete = int(_lagg_to_delete)
+        else:
+            print("Invalid option")
+            continue
 
-    print(_("Deleting lagg interface:"), end=' ')
-    try:
-        lagg.delete()
-    except Exception:
-        print(_("Failed"))
-        return False
-    print(_("Ok"))
-    print(_("Restarting network:"), end=' ')
-    try:
-        with Client() as c:
-            c.call('service.start', 'network')
-    except Exception:
-        print(_("Failed"))
-        return False
-    print(_("ok"))
+        if _lagg_to_delete in range(1, len(choices) + 1):
+            lagg_to_delete = choices[_lagg_to_delete - 1]
+        else:
+            print("Invalid option")
+            continue
 
-    return True
+        # send it off to the API
+        try:
+            with Client() as c:
+                c.call('interface.delete', lagg_to_delete)
+                c.call('service.start', 'network')
+                print(f"Successfully deleted {os_lagg_name}")
+                return True
+        except Exception as e:
+            print(f"Failed deleting {os_lagg_name} interface with error: \n%s", e)
+            return False
 
 
 def configure_vlan(*args):
@@ -1149,11 +1103,21 @@ def configure_vlan(*args):
             continue
 
     # get our list of nics
-    choices = get_nic_choices()
+    nics = get_nic_choices()
 
-    # prep list of nics if creating vlan
+    # prep list of nics for creating vlan
     if create_vlan:
-        choices = [i for i in choices if not i.startswith('vlan')]
+        exclude = []
+        for i in nics:
+            if i['type'] == 'LINK_AGGREGATION':
+                for j in i['lag_ports']:
+                    exclude.append(j)
+            elif i['type'] == 'VLAN':
+                exclude.append(i['id'])
+
+        # sort the nics
+        choices = sorted([i['id'] for i in nics if i['id'] not in exclude])
+
         # this shouldn't happen but check anyway
         if not choices:
             print("No parent interfaces detected")
@@ -1234,7 +1198,7 @@ def configure_vlan(*args):
 
     # prep list of nics if deleting vlan
     if delete_vlan:
-        choices = [i for i in choices if i.startswith('vlan')]
+        choices = [i['id'] for i in nics if i['id'].startswith('vlan')]
         # means no vlans are created so nothing to do
         if not choices:
             print("No vlan interfaces to delete")
